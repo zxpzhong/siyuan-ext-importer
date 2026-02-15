@@ -122,7 +122,12 @@
 
     function isWolaiWorkspaceExport(entries: ZipEntryFile[]) {
         const topFolders = new Set(entries.map((entry) => normalizePath(entry.parent).split('/')[0]).filter(Boolean));
-        return topFolders.has('pages') && (topFolders.has('images') || topFolders.has('video') || topFolders.has('file'));
+        return topFolders.has('pages');
+    }
+
+    function isWolaiZip(entries: ZipEntryFile[]) {
+        const markdownCount = entries.filter((entry) => entry.extension === 'md').length;
+        return markdownCount > 0;
     }
 
     function toSiyuanDocPath(filepath: string) {
@@ -140,11 +145,22 @@
 
     async function importWolaiWorkspaceZip(zipFile: WebPickedFile) {
         const entries = await listZipEntries(zipFile);
-        if (!isWolaiWorkspaceExport(entries)) {
-            throw new Error('Not a Wolai workspace export zip');
+        if (!isWolaiZip(entries)) {
+            throw new Error('Not a Wolai markdown zip');
         }
 
-        const markdownEntries = entries.filter((entry) => entry.extension === 'md' && (normalizePath(entry.filepath).startsWith('pages/') || !entry.parent));
+        const workspaceExport = isWolaiWorkspaceExport(entries);
+
+        const markdownEntries = entries.filter((entry) => {
+            if (entry.extension !== 'md') {
+                return false;
+            }
+            if (!workspaceExport) {
+                return true;
+            }
+
+            return normalizePath(entry.filepath).startsWith('pages/') || !entry.parent;
+        });
         const attachmentEntries = entries.filter((entry) => entry.extension !== 'md');
 
         total = markdownEntries.length + attachmentEntries.length;
