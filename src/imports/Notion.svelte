@@ -101,9 +101,30 @@
             .join('/');
     }
 
+
     function sanitizeDocSegment(segment: string) {
-        return segment.replace(/[\\/:*?"<>|]/g, '_').trim();
+        return segment.replace(/[\/:*?"<>|]/g, '_').trim();
     }
+
+    function sanitizeAssetSegment(segment: string) {
+        const sanitized = segment
+            .replace(/[\/:*?"<>|]/g, '_')
+            .replace(/[\x00-\x1F]/g, '_')
+            .trim();
+        return sanitized || '_';
+    }
+
+
+    function toSafeAssetRelativePath(filepath: string) {
+        const normalized = decodePath(filepath);
+        const safeSegments = normalized
+            .split('/')
+            .filter(Boolean)
+            .filter((segment) => segment !== '.' && segment !== '..')
+            .map((segment) => sanitizeAssetSegment(segment));
+        return safeSegments.join('/');
+    }
+
 
     function resolveRelativePath(currentFilePath: string, targetPath: string) {
         const base = normalizePath(currentFilePath);
@@ -198,16 +219,22 @@
         current = 0;
         dispatch('startImport');
 
-        const zipName = zipFile.basename || 'wolai';
+        const zipName = sanitizeAssetSegment(zipFile.basename || 'wolai');
         const attachmentMap = new Map<string, string>();
 
         for (const attachment of attachmentEntries) {
             const normalizedPath = normalizePath(attachment.filepath);
             const decodedPath = decodePath(attachment.filepath);
-            const assetPath = `/data/assets/wolai-import/${zipName}/${normalizedPath}`;
+            const safeRelativePath = toSafeAssetRelativePath(attachment.filepath);
+            if (!safeRelativePath) {
+                current += 1;
+                continue;
+            }
+            const assetPath = `/data/assets/wolai-import/${zipName}/${safeRelativePath}`;
             const data = await attachment.read();
+            const safeUploadName = sanitizeAssetSegment(attachment.name);
             const resPutFile = await client.putFile({
-                file: new File([data], attachment.name),
+                file: new File([data], safeUploadName),
                 path: assetPath,
             });
             if (resPutFile.code !== 0) {
