@@ -9,3 +9,5 @@ startCollectFilePreImport: start collect files before import
 startImport: start import notes
 importFinish: import notes success.
 import: import
+detectNotionZip: Detected Notion HTML ZIP export, start importing
+detectWolaiZip: Detected Wolai ZIP export, start importing

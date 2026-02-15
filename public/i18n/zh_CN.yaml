@@ -9,3 +9,5 @@ startCollectFilePreImport: 开始进行导入前的文件搜集
 startImport: 开始执行数据导入
 importFinish: 导入数据完成
 import: 导入
+detectNotionZip: 检测为 Notion HTML 导出，开始导入
+detectWolaiZip: 检测为 Wolai ZIP 导出，开始导入
