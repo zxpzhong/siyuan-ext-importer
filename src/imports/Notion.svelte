@@ -88,6 +88,10 @@
         return segment.replace(/[\\/:*?"<>|]/g, '_').trim() || 'untitled';
     }
 
+    function stripWolaiIdSuffix(name: string) {
+        return name.replace(/_[a-zA-Z0-9]{16,}$/g, '').trim();
+    }
+
     function sanitizeAsciiSegment(segment: string) {
         const ascii = segment
             .replace(/[^a-zA-Z0-9._-]/g, '_')
@@ -100,16 +104,59 @@
         const rawName = decodePath(sourcePath).split('/').filter(Boolean).pop() ?? 'file';
         const extMatch = rawName.match(/\.([a-zA-Z0-9]{1,16})$/);
         const ext = extMatch ? `.${extMatch[1].toLowerCase()}` : '';
-        return `asset_${index}${ext}`;
+        const baseName = sanitizeAsciiSegment(rawName.replace(/\.[^.]+$/, ''));
+        return `${baseName}-${index}${ext}`;
+    }
+
+    function unwrapMarkdownLink(link: string) {
+        if (link.startsWith('<') && link.endsWith('>')) {
+            return link.slice(1, -1);
+        }
+        return link;
+    }
+
+    function isExternalLink(value: string) {
+        return /^(https?:|data:|mailto:|#)/i.test(value);
+    }
+
+    function collectLinkedMarkdownPaths(markdown: string, filePath: string, markdownPaths: Set<string>) {
+        const linkedPaths = new Set<string>();
+        const register = (rawLink: string) => {
+            const unwrappedLink = unwrapMarkdownLink(rawLink.trim());
+            if (!unwrappedLink || isExternalLink(unwrappedLink)) {
+                return;
+            }
+            const { path } = splitLink(unwrappedLink);
+            const resolvedPath = resolveRelativePath(filePath, path);
+            const normalized = decodePath(resolvedPath);
+            if (!normalized.toLowerCase().endsWith('.md')) {
+                return;
+            }
+            if (markdownPaths.has(normalized)) {
+                linkedPaths.add(normalized);
+            }
+        };
+
+        markdown.replace(/(!?\[[^\]]*\]\()([^\)]+)(\))/g, (_, prefix, link) => {
+            if (!prefix.startsWith('!')) {
+                register(link);
+            }
+            return '';
+        });
+        markdown.replace(/<a[^>]+href="([^"]+)"/g, (_, link) => {
+            register(link);
+            return '';
+        });
+        return linkedPaths;
     }
 
     function rewriteAttachmentLinks(markdown: string, filePath: string, attachmentMap: Map<string, string>) {
-        const isExternalLink = (value: string) => /^(https?:|data:|mailto:|#)/i.test(value);
         const rewrite = (rawLink: string) => {
-            if (isExternalLink(rawLink)) {
+            const unwrappedLink = unwrapMarkdownLink(rawLink);
+            if (isExternalLink(unwrappedLink)) {
                 return rawLink;
             }
-            const { path, suffix } = splitLink(rawLink);
+            const { path, suffix } = splitLink(unwrappedLink);
             const resolvedPath = resolveRelativePath(filePath, path);
             const mapped = attachmentMap.get(resolvedPath) || attachmentMap.get(decodePath(resolvedPath));
             return mapped ? `${mapped}${suffix}` : rawLink;
@@ -145,7 +192,7 @@
 
         const parts = normalized.split('/').filter(Boolean);
         const fileName = parts.pop() ?? 'untitled.md';
-        const title = sanitizeDocSegment(fileName.replace(/\.[^.]+$/, ''));
+        const title = sanitizeDocSegment(stripWolaiIdSuffix(fileName.replace(/\.[^.]+$/, '')));
         const parent = parts.map((segment) => sanitizeDocSegment(segment)).filter(Boolean).join('/');
         return parent ? `/${parent}/${title}` : `/${title}`;
     }
@@ -178,7 +225,6 @@
         current = 0;
         dispatch('startImport');
 
-        const zipName = sanitizeAsciiSegment(zipFile.basename || 'wolai');
         const attachmentMap = new Map<string, string>();
 
         let assetIndex = 1;
@@ -187,7 +233,7 @@
                 const normalizedPath = normalizePath(attachment.filepath);
                 const decodedPath = decodePath(attachment.filepath);
                 const safeFileName = getSafeAssetFileName(decodedPath, assetIndex);
-                const assetPath = `/data/assets/wolai-import/${zipName}/${safeFileName}`;
+                const assetPath = `/data/assets/${safeFileName}`;
                 const data = await attachment.readBlob();
                 const resPutFile = await client.putFile({
                     file: new File([data], safeFileName),
@@ -208,15 +254,56 @@
         }
 
         const sortedMarkdownEntries = markdownEntries.sort((a, b) => a.filepath.localeCompare(b.filepath));
+        const markdownPathSet = new Set(sortedMarkdownEntries.map((entry) => decodePath(entry.filepath)));
+        const parentByChildPath = new Map<string, string>();
+        const titleByMarkdownPath = new Map<string, string>();
+
+        for (const markdownFile of sortedMarkdownEntries) {
+            const normalizedPath = decodePath(markdownFile.filepath);
+            titleByMarkdownPath.set(normalizedPath, toSiyuanDocPath(markdownFile.filepath, pagesPrefix).split('/').pop() || 'untitled');
+        }
+
+        for (const markdownFile of sortedMarkdownEntries) {
+            const markdownPath = decodePath(markdownFile.filepath);
+            const markdownText = await markdownFile.readText();
+            const linkedMarkdownPaths = collectLinkedMarkdownPaths(markdownText, markdownPath, markdownPathSet);
+            for (const childPath of linkedMarkdownPaths) {
+                if (childPath === markdownPath || parentByChildPath.has(childPath)) {
+                    continue;
+                }
+                parentByChildPath.set(childPath, markdownPath);
+            }
+        }
+
+        function buildDocPath(markdownPath: string, fallbackPath: string) {
+            const folderSegments: string[] = [];
+            const visited = new Set<string>();
+            let currentPath = parentByChildPath.get(markdownPath);
+            while (currentPath && !visited.has(currentPath)) {
+                visited.add(currentPath);
+                const parentTitle = titleByMarkdownPath.get(currentPath);
+                if (parentTitle) {
+                    folderSegments.unshift(parentTitle);
+                }
+                currentPath = parentByChildPath.get(currentPath);
+            }
+            const docTitle = fallbackPath.split('/').filter(Boolean).pop() || 'untitled';
+            if (folderSegments.length === 0) {
+                return fallbackPath;
+            }
+            return `/${[...folderSegments, docTitle].join('/')}`;
+        }
+
         for (const markdownFile of sortedMarkdownEntries) {
             try {
                 const markdownText = await markdownFile.readText();
                 const normalizedMarkdownPath = decodePath(markdownFile.filepath);
                 const markdownWithAssets = rewriteAttachmentLinks(markdownText, normalizedMarkdownPath, attachmentMap);
+                const fallbackPath = toSiyuanDocPath(markdownFile.filepath, pagesPrefix);
                 const resCreateDoc = await client.createDocWithMd({
                     markdown: markdownWithAssets,
                     notebook: currentNotebook.id,
-                    path: toSiyuanDocPath(markdownFile.filepath, pagesPrefix),
+                    path: buildDocPath(normalizedMarkdownPath, fallbackPath),
                 });
                 if (resCreateDoc.code !== 0) {
                     console.error(resCreateDoc.msg, markdownFile.filepath);
