@@ -121,19 +121,26 @@
     }
 
     function isWolaiWorkspaceExport(entries: ZipEntryFile[]) {
-        const topFolders = new Set(entries.map((entry) => normalizePath(entry.parent).split('/')[0]).filter(Boolean));
-        return topFolders.has('pages');
+        return entries.some((entry) => /(^|\/)pages\//.test(normalizePath(entry.filepath)));
     }
 
-    function isWolaiZip(entries: ZipEntryFile[]) {
-        const markdownCount = entries.filter((entry) => entry.extension === 'md').length;
-        return markdownCount > 0;
-    }
-
-    function toSiyuanDocPath(filepath: string) {
-        let normalized = decodePath(filepath);
+    function findPagesPrefix(filepath: string) {
+        const normalized = decodePath(filepath);
+        const marker = '/pages/';
         if (normalized.startsWith('pages/')) {
-            normalized = normalized.slice('pages/'.length);
+            return 'pages/';
+        }
+        const idx = normalized.indexOf(marker);
+        if (idx >= 0) {
+            return normalized.slice(0, idx + marker.length);
+        }
+        return '';
+    }
+
+    function toSiyuanDocPath(filepath: string, pagesPrefix: string) {
+        let normalized = decodePath(filepath);
+        if (pagesPrefix && normalized.startsWith(pagesPrefix)) {
+            normalized = normalized.slice(pagesPrefix.length);
         }
 
         const parts = normalized.split('/').filter(Boolean);
@@ -145,11 +152,10 @@
 
     async function importWolaiWorkspaceZip(zipFile: WebPickedFile) {
         const entries = await listZipEntries(zipFile);
-        if (!isWolaiZip(entries)) {
-            throw new Error('Not a Wolai markdown zip');
-        }
-
         const workspaceExport = isWolaiWorkspaceExport(entries);
+        const pagesPrefix = workspaceExport
+            ? (findPagesPrefix(entries.find((entry) => /(^|\/)pages\//.test(normalizePath(entry.filepath)))?.filepath || '') || 'pages/')
+            : '';
 
         const markdownEntries = entries.filter((entry) => {
             if (entry.extension !== 'md') {
@@ -159,8 +165,13 @@
                 return true;
             }
 
-            return normalizePath(entry.filepath).startsWith('pages/') || !entry.parent;
+            const normalizedPath = normalizePath(entry.filepath);
+            const inPages = pagesPrefix ? normalizePath(decodePath(entry.filepath)).startsWith(pagesPrefix) : /(^|\/)pages\//.test(normalizedPath);
+            return inPages || !entry.parent;
         });
+        if (markdownEntries.length === 0) {
+            throw new Error('ZIP 中未找到可导入的 Markdown 页面');
+        }
         const attachmentEntries = entries.filter((entry) => entry.extension !== 'md');
 
         total = markdownEntries.length + attachmentEntries.length;
@@ -200,7 +211,7 @@
             const resCreateDoc = await client.createDocWithMd({
                 markdown: markdownWithAssets,
                 notebook: currentNotebook.id,
-                path: toSiyuanDocPath(markdownFile.filepath),
+                path: toSiyuanDocPath(markdownFile.filepath, pagesPrefix),
             });
             if (resCreateDoc.code !== 0) {
                 console.error(resCreateDoc.msg, markdownFile.filepath);
