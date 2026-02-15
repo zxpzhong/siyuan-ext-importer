@@ -12,3 +12,6 @@
 - 支持 `https://github.com/<owner>/<repo>/archive/refs/heads/main.zip` 这类链接。
 - 会按压缩包内目录层级保存附件文件路径。
 - Markdown 文件会按目录层级创建思源文档。
+
+- 可选填写 HTTP/HTTPS 代理路径。下载 GitHub ZIP 时会优先按链接协议分别走对应代理。
+- 代理路径支持：`https://proxy.example.com/fetch?url=` 或 `https://proxy.example.com/{url}`（会自动 URL 编码）。

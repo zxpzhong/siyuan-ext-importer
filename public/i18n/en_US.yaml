@@ -12,3 +12,5 @@ import: import
 detectWolaiZip: Detected Wolai workspace ZIP export, start importing
 downloadingGithubZip: Downloading GitHub ZIP
 pleaseSelectZipOrUrl: Please select a ZIP file or provide a GitHub ZIP URL
+httpProxyPath: HTTP proxy path (optional)
+httpsProxyPath: HTTPS proxy path (optional)

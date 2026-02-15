@@ -21,6 +21,8 @@
     let clickImportLoading = false;
     let files;
     let githubZipUrl = '';
+    let httpProxyPath = '';
+    let httpsProxyPath = '';
 
     $: dispatch('progressChange', { current, total });
 
@@ -165,6 +167,26 @@
         return entries.some((entry) => /(^|\/)pages\//.test(normalizePath(entry.filepath)));
     }
 
+
+    function buildDownloadUrl(rawUrl: string) {
+        const sourceUrl = rawUrl.trim();
+        const useHttpsProxy = /^https:\/\//i.test(sourceUrl);
+        const proxyPath = (useHttpsProxy ? httpsProxyPath : httpProxyPath).trim();
+        if (!proxyPath) {
+            return sourceUrl;
+        }
+
+        if (proxyPath.includes('{url}')) {
+            return proxyPath.replaceAll('{url}', encodeURIComponent(sourceUrl));
+        }
+
+        if (proxyPath.endsWith('=')) {
+            return `${proxyPath}${encodeURIComponent(sourceUrl)}`;
+        }
+
+        const joiner = proxyPath.includes('?') ? '&' : '?';
+        return `${proxyPath}${joiner}url=${encodeURIComponent(sourceUrl)}`;
+    }
     async function downloadZipFromUrl(url: string) {
         const directFetch = async (targetUrl: string) => {
             const response = await fetch(targetUrl);
@@ -196,12 +218,14 @@
             return new Blob([rawBytes], { type: contentType || 'application/zip' });
         };
 
+        const targetUrl = buildDownloadUrl(url);
+
         let zipBlob: Blob;
         try {
-            zipBlob = await directFetch(url);
+            zipBlob = await directFetch(targetUrl);
         } catch (error) {
             console.warn('direct zip fetch failed, fallback to forwardProxy', error);
-            const proxyRes = await forwardProxy(url, 'GET', {}, [], 1000 * 60 * 10, 'application/octet-stream');
+            const proxyRes = await forwardProxy(targetUrl, 'GET', {}, [], 1000 * 60 * 10, 'application/octet-stream');
             if (proxyRes.code !== 0 || !proxyRes.data?.body) {
                 throw new Error(`下载失败: ${proxyRes.msg || 'network error'}`);
             }
@@ -334,6 +358,15 @@
     <KRow class="mt-2">
         <KCol span={24}>
             <KInput bind:value={githubZipUrl} placeholder="GitHub ZIP URL (e.g. https://github.com/owner/repo/archive/refs/heads/main.zip)" />
+        </KCol>
+    </KRow>
+
+    <KRow class="mt-2">
+        <KCol span={12}>
+            <KInput bind:value={httpProxyPath} placeholder={pluginInstance.i18n.httpProxyPath || "HTTP proxy path (optional)"} />
+        </KCol>
+        <KCol span={12}>
+            <KInput bind:value={httpsProxyPath} placeholder={pluginInstance.i18n.httpsProxyPath || "HTTPS proxy path (optional)"} />
         </KCol>
     </KRow>
 
