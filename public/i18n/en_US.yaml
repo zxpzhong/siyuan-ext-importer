@@ -10,3 +10,5 @@ startImport: start import notes
 importFinish: import notes success.
 import: import
 detectWolaiZip: Detected Wolai workspace ZIP export, start importing
+downloadingGithubZip: Downloading GitHub ZIP
+pleaseSelectZipOrUrl: Please select a ZIP file or provide a GitHub ZIP URL

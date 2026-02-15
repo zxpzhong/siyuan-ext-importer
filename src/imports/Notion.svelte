@@ -3,6 +3,7 @@
 	import { KCol, KRow } from '@ikun-ui/grid';
 	import { KDivider } from '@ikun-ui/divider';
     import { KButton } from '@ikun-ui/button';
+    import { KInput } from '@ikun-ui/input';
     import { WebPickedFile } from '@/libs/filesystem';
     import { readZip, ZipEntryFile } from '@/libs/zip';
 	import { Client } from '@siyuan-community/siyuan-sdk';
@@ -10,21 +11,21 @@
     import { createEventDispatcher } from 'svelte';
     import Ikun from '@/assets/ikun.svelte';
     import { showMessage } from 'siyuan';
+    import { upload } from '@/api';
 
     const dispatch = createEventDispatcher();
+    const client = new Client();
 
     let current = 0;
     let total = 100;
+    let clickImportLoading = false;
+    let files;
+    let githubZipUrl = '';
 
     $: dispatch('progressChange', { current, total });
 
-    const client = new Client();
-
     export let currentNotebook: any = { name: '' };
     export let pluginInstance;
-
-    let clickImportLoading = false;
-    let files;
 
     async function listZipEntries(file: WebPickedFile): Promise<ZipEntryFile[]> {
         let zipEntries: ZipEntryFile[] = [];
@@ -96,11 +97,155 @@
         return ascii || 'file';
     }
 
-    function getSafeAssetFileName(sourcePath: string, index: number) {
-        const rawName = decodePath(sourcePath).split('/').filter(Boolean).pop() ?? 'file';
-        const extMatch = rawName.match(/\.([a-zA-Z0-9]{1,16})$/);
-        const ext = extMatch ? `.${extMatch[1].toLowerCase()}` : '';
-        return `asset_${index}${ext}`;
+    function findCommonRootPrefix(entries: ZipEntryFile[]) {
+        const segments = entries.map((entry) => decodePath(entry.filepath).split('/').filter(Boolean));
+        if (!segments.length || segments.some((parts) => parts.length === 0)) {
+            return '';
+        }
+        const first = segments[0][0];
+        const same = segments.every((parts) => parts[0] === first && parts.length > 1);
+        return same ? `${first}/` : '';
+    }
+
+    function findPagesPrefix(filepath: string) {
+        const normalized = decodePath(filepath);
+        const marker = '/pages/';
+        if (normalized.startsWith('pages/')) {
+            return 'pages/';
+        }
+        const idx = normalized.indexOf(marker);
+        if (idx >= 0) {
+            return normalized.slice(0, idx + marker.length);
+        }
+        return '';
+    }
+
+    function toSiyuanDocPath(filepath: string, pagesPrefix: string, rootPrefix: string) {
+        let normalized = decodePath(filepath);
+        if (pagesPrefix && normalized.startsWith(pagesPrefix)) {
+            normalized = normalized.slice(pagesPrefix.length);
+        } else if (rootPrefix && normalized.startsWith(rootPrefix)) {
+            normalized = normalized.slice(rootPrefix.length);
+        }
+
+        const parts = normalized.split('/').filter(Boolean);
+        const fileName = parts.pop() ?? 'untitled.md';
+        const title = sanitizeDocSegment(fileName.replace(/\.[^.]+$/, ''));
+        const parent = parts.map((segment) => sanitizeDocSegment(segment)).filter(Boolean).join('/');
+        return parent ? `/${parent}/${title}` : `/${title}`;
+    }
+
+    function removeKnownPrefix(filepath: string, prefixes: string[]) {
+        for (const prefix of prefixes) {
+            if (prefix && filepath.startsWith(prefix)) {
+                return filepath.slice(prefix.length);
+            }
+        }
+        return filepath;
+    }
+
+    function makeAttachmentLookupKeys(filepath: string, rootPrefix: string, pagesPrefix: string) {
+        const normalized = normalizePath(filepath);
+        const decoded = decodePath(filepath);
+        const keys = [normalized, decoded];
+
+        const strippedNormalized = removeKnownPrefix(normalized, [pagesPrefix, rootPrefix]);
+        const strippedDecoded = removeKnownPrefix(decoded, [pagesPrefix, rootPrefix]);
+        keys.push(strippedNormalized, strippedDecoded);
+
+        return Array.from(new Set(keys.filter(Boolean)));
+    }
+
+    function extractMarkdownLinkTargets(markdown: string) {
+        const links: string[] = [];
+        const regex = /\[[^\]]*\]\(([^)\s]+\.md(?:[#?][^)]*)?)\)/g;
+        let match: RegExpExecArray | null;
+        while ((match = regex.exec(markdown)) !== null) {
+            const { path } = splitLink(match[1]);
+            links.push(path);
+        }
+        return links;
+    }
+
+    function isLikelyFolderIndexMarkdown(markdown: string, linkedDocCount: number) {
+        if (linkedDocCount < 2) {
+            return false;
+        }
+        const compact = markdown
+            .replace(/\[[^\]]*\]\([^)]+\.md(?:[#?][^)]*)?\)/g, '')
+            .replace(/[#>*\-\s`~]+/g, '')
+            .trim();
+        return compact.length <= 80;
+    }
+
+    function buildVirtualHierarchy(
+        markdownOrder: string[],
+        markdownByPath: Map<string, string>,
+        pagesPrefix: string,
+        rootPrefix: string,
+    ) {
+        const parentMap = new Map<string, string>();
+        const markdownPathSet = new Set(markdownByPath.keys());
+
+        for (const markdownPath of markdownOrder) {
+            const markdownText = markdownByPath.get(markdownPath);
+            if (!markdownText) {
+                continue;
+            }
+            const rawTargets = extractMarkdownLinkTargets(markdownText);
+            const resolvedTargets = rawTargets
+                .map((target) => resolveRelativePath(markdownPath, target))
+                .map((target) => decodePath(target));
+            const childTargets = Array.from(new Set(resolvedTargets.filter((target) => markdownPathSet.has(target) && target !== markdownPath)));
+            if (!isLikelyFolderIndexMarkdown(markdownText, childTargets.length)) {
+                continue;
+            }
+            for (const child of childTargets) {
+                if (!parentMap.has(child)) {
+                    parentMap.set(child, markdownPath);
+                }
+            }
+        }
+
+        const docPathMap = new Map<string, string>();
+        const titleMap = new Map<string, string>();
+        for (const markdownPath of markdownOrder) {
+            const normalized = removeKnownPrefix(markdownPath, [pagesPrefix, rootPrefix]);
+            const parts = normalized.split('/').filter(Boolean);
+            const fileName = parts.pop() ?? 'untitled.md';
+            const title = sanitizeDocSegment(fileName.replace(/\.[^.]+$/, ''));
+            titleMap.set(markdownPath, title);
+        }
+
+        const getDocPath = (markdownPath: string, visited = new Set<string>()): string => {
+            const cached = docPathMap.get(markdownPath);
+            if (cached) {
+                return cached;
+            }
+            const selfTitle = titleMap.get(markdownPath) || 'untitled';
+            if (visited.has(markdownPath)) {
+                const fallback = toSiyuanDocPath(markdownPath, pagesPrefix, rootPrefix);
+                docPathMap.set(markdownPath, fallback);
+                return fallback;
+            }
+            const parent = parentMap.get(markdownPath);
+            if (!parent) {
+                const fallback = toSiyuanDocPath(markdownPath, pagesPrefix, rootPrefix);
+                docPathMap.set(markdownPath, fallback);
+                return fallback;
+            }
+            visited.add(markdownPath);
+            const parentPath = getDocPath(parent, visited);
+            visited.delete(markdownPath);
+            const path = `${parentPath}/${selfTitle}`;
+            docPathMap.set(markdownPath, path);
+            return path;
+        };
+
+        for (const markdownPath of markdownOrder) {
+            getDocPath(markdownPath);
+        }
+        return docPathMap;
     }
 
     function rewriteAttachmentLinks(markdown: string, filePath: string, attachmentMap: Map<string, string>) {
@@ -124,35 +269,21 @@
         return entries.some((entry) => /(^|\/)pages\//.test(normalizePath(entry.filepath)));
     }
 
-    function findPagesPrefix(filepath: string) {
-        const normalized = decodePath(filepath);
-        const marker = '/pages/';
-        if (normalized.startsWith('pages/')) {
-            return 'pages/';
+    async function downloadZipFromUrl(url: string) {
+        const response = await fetch(url);
+        if (!response.ok) {
+            throw new Error(`下载失败: ${response.status}`);
         }
-        const idx = normalized.indexOf(marker);
-        if (idx >= 0) {
-            return normalized.slice(0, idx + marker.length);
-        }
-        return '';
+        const zipBlob = await response.blob();
+        const pathName = new URL(url).pathname;
+        const fileName = pathName.split('/').pop() || 'github.zip';
+        return new WebPickedFile(new File([zipBlob], fileName, { type: 'application/zip' }));
     }
 
-    function toSiyuanDocPath(filepath: string, pagesPrefix: string) {
-        let normalized = decodePath(filepath);
-        if (pagesPrefix && normalized.startsWith(pagesPrefix)) {
-            normalized = normalized.slice(pagesPrefix.length);
-        }
-
-        const parts = normalized.split('/').filter(Boolean);
-        const fileName = parts.pop() ?? 'untitled.md';
-        const title = sanitizeDocSegment(fileName.replace(/\.[^.]+$/, ''));
-        const parent = parts.map((segment) => sanitizeDocSegment(segment)).filter(Boolean).join('/');
-        return parent ? `/${parent}/${title}` : `/${title}`;
-    }
-
-    async function importWolaiWorkspaceZip(zipFile: WebPickedFile) {
+    async function importZipFile(zipFile: WebPickedFile, fromGithubUrl = false) {
         const entries = await listZipEntries(zipFile);
         const workspaceExport = isWolaiWorkspaceExport(entries);
+        const rootPrefix = fromGithubUrl ? findCommonRootPrefix(entries) : '';
         const pagesPrefix = workspaceExport
             ? (findPagesPrefix(entries.find((entry) => /(^|\/)pages\//.test(normalizePath(entry.filepath)))?.filepath || '') || 'pages/')
             : '';
@@ -164,42 +295,52 @@
             if (!workspaceExport) {
                 return true;
             }
-
             const normalizedPath = normalizePath(entry.filepath);
             const inPages = pagesPrefix ? normalizePath(decodePath(entry.filepath)).startsWith(pagesPrefix) : /(^|\/)pages\//.test(normalizedPath);
             return inPages || !entry.parent;
         });
         if (markdownEntries.length === 0) {
-            throw new Error('ZIP 中未找到可导入的 Markdown 页面（请确认是 Wolai Markdown 导出）');
+            throw new Error('ZIP 中未找到可导入的 Markdown 页面');
         }
-        const attachmentEntries = entries.filter((entry) => entry.extension !== 'md');
 
+        const attachmentEntries = entries.filter((entry) => entry.extension !== 'md');
         total = markdownEntries.length + attachmentEntries.length;
         current = 0;
         dispatch('startImport');
 
-        const zipName = sanitizeAsciiSegment(zipFile.basename || 'wolai');
         const attachmentMap = new Map<string, string>();
+        const markdownTextByPath = new Map<string, string>();
+        const sortedMarkdownEntries = markdownEntries.sort((a, b) => a.filepath.localeCompare(b.filepath));
 
-        let assetIndex = 1;
+        for (const markdownFile of sortedMarkdownEntries) {
+            const markdownPath = decodePath(markdownFile.filepath);
+            try {
+                markdownTextByPath.set(markdownPath, await markdownFile.readText());
+            } catch (error) {
+                console.error('markdown pre-read failed', markdownFile.filepath, error);
+            }
+        }
+
+        const hierarchyDocPathMap = workspaceExport
+            ? buildVirtualHierarchy(
+                sortedMarkdownEntries.map((entry) => decodePath(entry.filepath)),
+                markdownTextByPath,
+                pagesPrefix,
+                rootPrefix,
+            )
+            : new Map<string, string>();
+
         for (const attachment of attachmentEntries) {
             try {
-                const normalizedPath = normalizePath(attachment.filepath);
-                const decodedPath = decodePath(attachment.filepath);
-                const safeFileName = getSafeAssetFileName(decodedPath, assetIndex);
-                const assetPath = `/data/assets/wolai-import/${zipName}/${safeFileName}`;
                 const data = await attachment.readBlob();
-                const resPutFile = await client.putFile({
-                    file: new File([data], safeFileName),
-                    path: assetPath,
-                });
-                if (resPutFile.code === 0) {
-                    const siyuanAssetPath = assetPath.replace('/data', '');
-                    attachmentMap.set(normalizedPath, siyuanAssetPath);
-                    attachmentMap.set(decodedPath, siyuanAssetPath);
-                    assetIndex += 1;
-                } else {
-                    console.error(resPutFile.msg, attachment.filepath);
+                const safeName = sanitizeAsciiSegment(attachment.name);
+                const uploadRes = await upload('assets', [new File([data], safeName)]);
+                const uploadedPath = uploadRes.succMap?.[safeName];
+                if (uploadedPath) {
+                    const lookupKeys = makeAttachmentLookupKeys(attachment.filepath, rootPrefix, pagesPrefix);
+                    for (const key of lookupKeys) {
+                        attachmentMap.set(key, uploadedPath);
+                    }
                 }
             } catch (error) {
                 console.error('attachment import failed', attachment.filepath, error);
@@ -207,16 +348,16 @@
             current += 1;
         }
 
-        const sortedMarkdownEntries = markdownEntries.sort((a, b) => a.filepath.localeCompare(b.filepath));
         for (const markdownFile of sortedMarkdownEntries) {
             try {
-                const markdownText = await markdownFile.readText();
                 const normalizedMarkdownPath = decodePath(markdownFile.filepath);
+                const markdownText = markdownTextByPath.get(normalizedMarkdownPath) || await markdownFile.readText();
                 const markdownWithAssets = rewriteAttachmentLinks(markdownText, normalizedMarkdownPath, attachmentMap);
                 const resCreateDoc = await client.createDocWithMd({
                     markdown: markdownWithAssets,
                     notebook: currentNotebook.id,
-                    path: toSiyuanDocPath(markdownFile.filepath, pagesPrefix),
+                    path: hierarchyDocPathMap.get(normalizedMarkdownPath)
+                        || toSiyuanDocPath(markdownFile.filepath, pagesPrefix, rootPrefix),
                 });
                 if (resCreateDoc.code !== 0) {
                     console.error(resCreateDoc.msg, markdownFile.filepath);
@@ -231,26 +372,39 @@
 	async function onClickImport() {
         clickImportLoading = true;
         try {
-            for (const file of files) {
+            const importTargets: { file: WebPickedFile, fromGithubUrl: boolean }[] = [];
+            for (const file of files || []) {
                 const pickedFile = new WebPickedFile(file);
-                if (pickedFile.extension !== 'zip') {
-                    continue;
+                if (pickedFile.extension === 'zip') {
+                    importTargets.push({ file: pickedFile, fromGithubUrl: false });
                 }
-                showMessage(pluginInstance.i18n.startCollectFilePreImport, 1000 * 30, 'info');
+            }
+
+            if (githubZipUrl.trim()) {
+                showMessage(pluginInstance.i18n.downloadingGithubZip || 'Downloading GitHub ZIP...', 5000, 'info');
+                const githubZipFile = await downloadZipFromUrl(githubZipUrl.trim());
+                importTargets.push({ file: githubZipFile, fromGithubUrl: true });
+            }
+
+            if (importTargets.length === 0) {
+                throw new Error(pluginInstance.i18n.pleaseSelectZipOrUrl || '请选择 ZIP 文件或填写 GitHub ZIP 链接');
+            }
+
+            showMessage(pluginInstance.i18n.startCollectFilePreImport, 1000 * 30, 'info');
+            for (const item of importTargets) {
                 showMessage(pluginInstance.i18n.detectWolaiZip, 4000, 'info');
-                await importWolaiWorkspaceZip(pickedFile);
+                await importZipFile(item.file, item.fromGithubUrl);
             }
             showMessage(pluginInstance.i18n.importFinish, -1, 'info');
         } catch (e) {
             console.error(e);
             const errMsg = e instanceof Error ? e.message : String(e);
-            showMessage(`Wolai ZIP 导入失败: ${errMsg}`, 1000 * 10, 'error');
+            showMessage(`ZIP 导入失败: ${errMsg}`, 1000 * 10, 'error');
         } finally {
             clickImportLoading = false;
         }
 	}
 </script>
-
 
 <div>
 	<KRow>
@@ -258,6 +412,12 @@
 			<FileInput bind:files accept_ext={['.zip']} />
 		</KCol>
 	</KRow>
+
+    <KRow class="mt-2">
+        <KCol span={24}>
+            <KInput bind:value={githubZipUrl} placeholder="GitHub ZIP URL (e.g. https://github.com/owner/repo/archive/refs/heads/main.zip)" />
+        </KCol>
+    </KRow>
 
 	<KDivider />
 	

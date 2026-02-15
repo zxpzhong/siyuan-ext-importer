@@ -10,3 +10,5 @@ startImport: 开始执行数据导入
 importFinish: 导入数据完成
 import: 导入
 detectWolaiZip: 检测为 Wolai 空间 ZIP 导出，开始导入
+downloadingGithubZip: 正在下载 GitHub ZIP
+pleaseSelectZipOrUrl: 请选择 ZIP 文件或填写 GitHub ZIP 链接
