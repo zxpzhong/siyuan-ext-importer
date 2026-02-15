@@ -11,6 +11,7 @@
     import { createEventDispatcher } from 'svelte';
     import Ikun from '@/assets/ikun.svelte';
     import { showMessage } from 'siyuan';
+    import { upload } from '@/api';
 
     const dispatch = createEventDispatcher();
     const client = new Client();
@@ -119,15 +120,6 @@
         return '';
     }
 
-    function toSafeAssetRelativePath(filepath: string, rootPrefix = '') {
-        let normalized = decodePath(filepath);
-        if (rootPrefix && normalized.startsWith(rootPrefix)) {
-            normalized = normalized.slice(rootPrefix.length);
-        }
-        const safeParts = normalized.split('/').filter(Boolean).map((segment) => sanitizeAsciiSegment(segment));
-        return safeParts.join('/');
-    }
-
     function toSiyuanDocPath(filepath: string, pagesPrefix: string, rootPrefix: string) {
         let normalized = decodePath(filepath);
         if (pagesPrefix && normalized.startsWith(pagesPrefix)) {
@@ -141,6 +133,119 @@
         const title = sanitizeDocSegment(fileName.replace(/\.[^.]+$/, ''));
         const parent = parts.map((segment) => sanitizeDocSegment(segment)).filter(Boolean).join('/');
         return parent ? `/${parent}/${title}` : `/${title}`;
+    }
+
+    function removeKnownPrefix(filepath: string, prefixes: string[]) {
+        for (const prefix of prefixes) {
+            if (prefix && filepath.startsWith(prefix)) {
+                return filepath.slice(prefix.length);
+            }
+        }
+        return filepath;
+    }
+
+    function makeAttachmentLookupKeys(filepath: string, rootPrefix: string, pagesPrefix: string) {
+        const normalized = normalizePath(filepath);
+        const decoded = decodePath(filepath);
+        const keys = [normalized, decoded];
+
+        const strippedNormalized = removeKnownPrefix(normalized, [pagesPrefix, rootPrefix]);
+        const strippedDecoded = removeKnownPrefix(decoded, [pagesPrefix, rootPrefix]);
+        keys.push(strippedNormalized, strippedDecoded);
+
+        return Array.from(new Set(keys.filter(Boolean)));
+    }
+
+    function extractMarkdownLinkTargets(markdown: string) {
+        const links: string[] = [];
+        const regex = /\[[^\]]*\]\(([^)\s]+\.md(?:[#?][^)]*)?)\)/g;
+        let match: RegExpExecArray | null;
+        while ((match = regex.exec(markdown)) !== null) {
+            const { path } = splitLink(match[1]);
+            links.push(path);
+        }
+        return links;
+    }
+
+    function isLikelyFolderIndexMarkdown(markdown: string, linkedDocCount: number) {
+        if (linkedDocCount < 2) {
+            return false;
+        }
+        const compact = markdown
+            .replace(/\[[^\]]*\]\([^)]+\.md(?:[#?][^)]*)?\)/g, '')
+            .replace(/[#>*\-\s`~]+/g, '')
+            .trim();
+        return compact.length <= 80;
+    }
+
+    function buildVirtualHierarchy(
+        markdownOrder: string[],
+        markdownByPath: Map<string, string>,
+        pagesPrefix: string,
+        rootPrefix: string,
+    ) {
+        const parentMap = new Map<string, string>();
+        const markdownPathSet = new Set(markdownByPath.keys());
+
+        for (const markdownPath of markdownOrder) {
+            const markdownText = markdownByPath.get(markdownPath);
+            if (!markdownText) {
+                continue;
+            }
+            const rawTargets = extractMarkdownLinkTargets(markdownText);
+            const resolvedTargets = rawTargets
+                .map((target) => resolveRelativePath(markdownPath, target))
+                .map((target) => decodePath(target));
+            const childTargets = Array.from(new Set(resolvedTargets.filter((target) => markdownPathSet.has(target) && target !== markdownPath)));
+            if (!isLikelyFolderIndexMarkdown(markdownText, childTargets.length)) {
+                continue;
+            }
+            for (const child of childTargets) {
+                if (!parentMap.has(child)) {
+                    parentMap.set(child, markdownPath);
+                }
+            }
+        }
+
+        const docPathMap = new Map<string, string>();
+        const titleMap = new Map<string, string>();
+        for (const markdownPath of markdownOrder) {
+            const normalized = removeKnownPrefix(markdownPath, [pagesPrefix, rootPrefix]);
+            const parts = normalized.split('/').filter(Boolean);
+            const fileName = parts.pop() ?? 'untitled.md';
+            const title = sanitizeDocSegment(fileName.replace(/\.[^.]+$/, ''));
+            titleMap.set(markdownPath, title);
+        }
+
+        const getDocPath = (markdownPath: string, visited = new Set<string>()): string => {
+            const cached = docPathMap.get(markdownPath);
+            if (cached) {
+                return cached;
+            }
+            const selfTitle = titleMap.get(markdownPath) || 'untitled';
+            if (visited.has(markdownPath)) {
+                const fallback = toSiyuanDocPath(markdownPath, pagesPrefix, rootPrefix);
+                docPathMap.set(markdownPath, fallback);
+                return fallback;
+            }
+            const parent = parentMap.get(markdownPath);
+            if (!parent) {
+                const fallback = toSiyuanDocPath(markdownPath, pagesPrefix, rootPrefix);
+                docPathMap.set(markdownPath, fallback);
+                return fallback;
+            }
+            visited.add(markdownPath);
+            const parentPath = getDocPath(parent, visited);
+            visited.delete(markdownPath);
+            const path = `${parentPath}/${selfTitle}`;
+            docPathMap.set(markdownPath, path);
+            return path;
+        };
+
+        for (const markdownPath of markdownOrder) {
+            getDocPath(markdownPath);
+        }
+        return docPathMap;
     }
 
     function rewriteAttachmentLinks(markdown: string, filePath: string, attachmentMap: Map<string, string>) {
@@ -203,24 +308,39 @@
         current = 0;
         dispatch('startImport');
 
-        const zipName = sanitizeAsciiSegment(zipFile.basename || 'zip');
         const attachmentMap = new Map<string, string>();
+        const markdownTextByPath = new Map<string, string>();
+        const sortedMarkdownEntries = markdownEntries.sort((a, b) => a.filepath.localeCompare(b.filepath));
+
+        for (const markdownFile of sortedMarkdownEntries) {
+            const markdownPath = decodePath(markdownFile.filepath);
+            try {
+                markdownTextByPath.set(markdownPath, await markdownFile.readText());
+            } catch (error) {
+                console.error('markdown pre-read failed', markdownFile.filepath, error);
+            }
+        }
+
+        const hierarchyDocPathMap = workspaceExport
+            ? buildVirtualHierarchy(
+                sortedMarkdownEntries.map((entry) => decodePath(entry.filepath)),
+                markdownTextByPath,
+                pagesPrefix,
+                rootPrefix,
+            )
+            : new Map<string, string>();
 
         for (const attachment of attachmentEntries) {
             try {
-                const normalizedPath = normalizePath(attachment.filepath);
-                const decodedPath = decodePath(attachment.filepath);
-                const safeRelativePath = toSafeAssetRelativePath(attachment.filepath, rootPrefix);
-                const assetPath = `/data/assets/zip-import/${zipName}/${safeRelativePath}`;
                 const data = await attachment.readBlob();
-                const resPutFile = await client.putFile({
-                    file: new File([data], sanitizeAsciiSegment(attachment.name)),
-                    path: assetPath,
-                });
-                if (resPutFile.code === 0) {
-                    const siyuanAssetPath = assetPath.replace('/data', '');
-                    attachmentMap.set(normalizedPath, siyuanAssetPath);
-                    attachmentMap.set(decodedPath, siyuanAssetPath);
+                const safeName = sanitizeAsciiSegment(attachment.name);
+                const uploadRes = await upload('assets', [new File([data], safeName)]);
+                const uploadedPath = uploadRes.succMap?.[safeName];
+                if (uploadedPath) {
+                    const lookupKeys = makeAttachmentLookupKeys(attachment.filepath, rootPrefix, pagesPrefix);
+                    for (const key of lookupKeys) {
+                        attachmentMap.set(key, uploadedPath);
+                    }
                 }
             } catch (error) {
                 console.error('attachment import failed', attachment.filepath, error);
@@ -228,16 +348,16 @@
             current += 1;
         }
 
-        const sortedMarkdownEntries = markdownEntries.sort((a, b) => a.filepath.localeCompare(b.filepath));
         for (const markdownFile of sortedMarkdownEntries) {
             try {
-                const markdownText = await markdownFile.readText();
                 const normalizedMarkdownPath = decodePath(markdownFile.filepath);
+                const markdownText = markdownTextByPath.get(normalizedMarkdownPath) || await markdownFile.readText();
                 const markdownWithAssets = rewriteAttachmentLinks(markdownText, normalizedMarkdownPath, attachmentMap);
                 const resCreateDoc = await client.createDocWithMd({
                     markdown: markdownWithAssets,
                     notebook: currentNotebook.id,
-                    path: toSiyuanDocPath(markdownFile.filepath, pagesPrefix, rootPrefix),
+                    path: hierarchyDocPathMap.get(normalizedMarkdownPath)
+                        || toSiyuanDocPath(markdownFile.filepath, pagesPrefix, rootPrefix),
                 });
                 if (resCreateDoc.code !== 0) {
                     console.error(resCreateDoc.msg, markdownFile.filepath);
