@@ -4,6 +4,7 @@
 	import { KDivider } from '@ikun-ui/divider';
     import { KButton } from '@ikun-ui/button';
     import { KInput } from '@ikun-ui/input';
+    import { forwardProxy } from '@/api';
     import { WebPickedFile } from '@/libs/filesystem';
     import { readZip, ZipEntryFile } from '@/libs/zip';
 	import { Client } from '@siyuan-community/siyuan-sdk';
@@ -165,11 +166,48 @@
     }
 
     async function downloadZipFromUrl(url: string) {
-        const response = await fetch(url);
-        if (!response.ok) {
-            throw new Error(`下载失败: ${response.status}`);
+        const directFetch = async (targetUrl: string) => {
+            const response = await fetch(targetUrl);
+            if (!response.ok) {
+                throw new Error(`下载失败: ${response.status}`);
+            }
+            return response.blob();
+        };
+
+        const parseProxyBodyAsBlob = (body: string, contentType: string) => {
+            const toBytes = (value: string) => Uint8Array.from(value, (ch) => ch.charCodeAt(0) & 0xff);
+            const looksLikeZip = (bytes: Uint8Array) => bytes.length >= 2 && bytes[0] === 0x50 && bytes[1] === 0x4b;
+
+            const rawBytes = toBytes(body);
+            if (looksLikeZip(rawBytes)) {
+                return new Blob([rawBytes], { type: contentType || 'application/zip' });
+            }
+
+            try {
+                const decoded = atob(body.replace(/\s+/g, ''));
+                const decodedBytes = toBytes(decoded);
+                if (looksLikeZip(decodedBytes)) {
+                    return new Blob([decodedBytes], { type: contentType || 'application/zip' });
+                }
+            } catch {
+                // ignore
+            }
+
+            return new Blob([rawBytes], { type: contentType || 'application/zip' });
+        };
+
+        let zipBlob: Blob;
+        try {
+            zipBlob = await directFetch(url);
+        } catch (error) {
+            console.warn('direct zip fetch failed, fallback to forwardProxy', error);
+            const proxyRes = await forwardProxy(url, 'GET', {}, [], 1000 * 60 * 10, 'application/octet-stream');
+            if (proxyRes.code !== 0 || !proxyRes.data?.body) {
+                throw new Error(`下载失败: ${proxyRes.msg || 'network error'}`);
+            }
+            zipBlob = parseProxyBodyAsBlob(proxyRes.data.body, proxyRes.data.contentType);
         }
-        const zipBlob = await response.blob();
+
         const pathName = new URL(url).pathname;
         const fileName = pathName.split('/').pop() || 'github.zip';
         return new WebPickedFile(new File([zipBlob], fileName, { type: 'application/zip' }));
