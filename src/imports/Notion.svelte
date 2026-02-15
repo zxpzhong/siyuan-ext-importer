@@ -170,7 +170,7 @@
             return inPages || !entry.parent;
         });
         if (markdownEntries.length === 0) {
-            throw new Error('ZIP 中未找到可导入的 Markdown 页面');
+            throw new Error('ZIP 中未找到可导入的 Markdown 页面（请确认是 Wolai Markdown 导出）');
         }
         const attachmentEntries = entries.filter((entry) => entry.extension !== 'md');
 
@@ -183,38 +183,46 @@
 
         let assetIndex = 1;
         for (const attachment of attachmentEntries) {
-            const normalizedPath = normalizePath(attachment.filepath);
-            const decodedPath = decodePath(attachment.filepath);
-            const safeFileName = getSafeAssetFileName(decodedPath, assetIndex);
-            const assetPath = `/data/assets/wolai-import/${zipName}/${safeFileName}`;
-            const data = await attachment.read();
-            const resPutFile = await client.putFile({
-                file: new File([data], safeFileName),
-                path: assetPath,
-            });
-            if (resPutFile.code === 0) {
-                const siyuanAssetPath = assetPath.replace('/data', '');
-                attachmentMap.set(normalizedPath, siyuanAssetPath);
-                attachmentMap.set(decodedPath, siyuanAssetPath);
-                assetIndex += 1;
-            } else {
-                console.error(resPutFile.msg, attachment.filepath);
+            try {
+                const normalizedPath = normalizePath(attachment.filepath);
+                const decodedPath = decodePath(attachment.filepath);
+                const safeFileName = getSafeAssetFileName(decodedPath, assetIndex);
+                const assetPath = `/data/assets/wolai-import/${zipName}/${safeFileName}`;
+                const data = await attachment.readBlob();
+                const resPutFile = await client.putFile({
+                    file: new File([data], safeFileName),
+                    path: assetPath,
+                });
+                if (resPutFile.code === 0) {
+                    const siyuanAssetPath = assetPath.replace('/data', '');
+                    attachmentMap.set(normalizedPath, siyuanAssetPath);
+                    attachmentMap.set(decodedPath, siyuanAssetPath);
+                    assetIndex += 1;
+                } else {
+                    console.error(resPutFile.msg, attachment.filepath);
+                }
+            } catch (error) {
+                console.error('attachment import failed', attachment.filepath, error);
             }
             current += 1;
         }
 
         const sortedMarkdownEntries = markdownEntries.sort((a, b) => a.filepath.localeCompare(b.filepath));
         for (const markdownFile of sortedMarkdownEntries) {
-            const markdownText = await markdownFile.readText();
-            const normalizedMarkdownPath = decodePath(markdownFile.filepath);
-            const markdownWithAssets = rewriteAttachmentLinks(markdownText, normalizedMarkdownPath, attachmentMap);
-            const resCreateDoc = await client.createDocWithMd({
-                markdown: markdownWithAssets,
-                notebook: currentNotebook.id,
-                path: toSiyuanDocPath(markdownFile.filepath, pagesPrefix),
-            });
-            if (resCreateDoc.code !== 0) {
-                console.error(resCreateDoc.msg, markdownFile.filepath);
+            try {
+                const markdownText = await markdownFile.readText();
+                const normalizedMarkdownPath = decodePath(markdownFile.filepath);
+                const markdownWithAssets = rewriteAttachmentLinks(markdownText, normalizedMarkdownPath, attachmentMap);
+                const resCreateDoc = await client.createDocWithMd({
+                    markdown: markdownWithAssets,
+                    notebook: currentNotebook.id,
+                    path: toSiyuanDocPath(markdownFile.filepath, pagesPrefix),
+                });
+                if (resCreateDoc.code !== 0) {
+                    console.error(resCreateDoc.msg, markdownFile.filepath);
+                }
+            } catch (error) {
+                console.error('markdown import failed', markdownFile.filepath, error);
             }
             current += 1;
         }
